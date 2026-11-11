@@ -1,0 +1,39 @@
+# GoReleaser configuration for tagged releases (see .github/workflows/release.yml).
+version: 2
+
+project_name: ddl-mt
+
+builds:
+  - main: .
+    binary: ddl-mt
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - '^Merge '
+
+release:
+  footer: |
+    ddl-mt is developed and maintained by [QBite Technologies](https://qbite.tech).

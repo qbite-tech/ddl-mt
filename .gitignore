@@ -1,0 +1,10 @@
+/bin/
+/dist/
+*.test
+coverage.out
+.env
+.env.*
+!.env.example
+/secrets/
+*.local.json
+

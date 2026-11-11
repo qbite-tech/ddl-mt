@@ -1,0 +1,20 @@
+{
+  "project": "shop",
+  "targets": {
+    "development": {
+      "database": "shop_dev",
+      "migrations_dir": "migrations/main",
+      "dsn_env": "SHOP_DEV_DSN"
+    },
+    "production": {
+      "database": "shop",
+      "migrations_dir": "migrations/main",
+      "dsn_env": "SHOP_PROD_DSN"
+    },
+    "analytics": {
+      "database": "shop_analytics",
+      "migrations_dir": "migrations/analytics",
+      "dsn_env": "SHOP_ANALYTICS_DSN"
+    }
+  }
+}

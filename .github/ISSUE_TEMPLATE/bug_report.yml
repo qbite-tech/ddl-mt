@@ -1,0 +1,48 @@
+name: Bug report
+description: Report incorrect behavior in ddl-mt
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security issue?** Do not file it here. Use the
+        [private reporting form](https://github.com/qbite-tech/ddl-mt/security/advisories/new).
+
+        **Never paste real credentials, connection strings, hostnames, or production
+        SQL/data.** Replace them with placeholders.
+  - type: input
+    id: version
+    attributes:
+      label: ddl-mt version
+      description: Output of `ddl-mt version`
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, PostgreSQL version, and PgBouncer version/pool mode if used
+      placeholder: Ubuntu 24.04, PostgreSQL 17.2, PgBouncer 1.25 (transaction)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include the exact command and full (redacted) output.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: A minimal ddl-mt.json (redacted) and migration files help most.
+    validations:
+      required: true
