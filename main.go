@@ -151,6 +151,7 @@ Commands:
 Global flags must precede the command:
   --config <path>                Credentials JSON containing {"DB_DSN":"..."}
   --connection-mode <mode>      transaction (default) or session; overrides target
+  --role <name>                 Role to switch to for all database work; overrides target
   --lock-timeout <duration>     Maximum migration lock wait (default 30s)
   --timeout <duration>           Database deadline including lock waits (default 5m)
 

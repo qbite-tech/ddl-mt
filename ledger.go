@@ -69,6 +69,39 @@ func acquireMigrationLock(ctx context.Context, q ledgerQueryer, o options, sessi
 	}
 }
 
+// setRole switches the connection or transaction to the configured role and does
+// nothing when no role is configured. A local switch lasts until the enclosing
+// transaction ends, which keeps it safe under transaction pooling; a session
+// switch lasts until RESET ROLE and requires a direct or session-pooled endpoint.
+func setRole(ctx context.Context, q sqlExecutor, o options, local bool) error {
+	if o.Role == "" {
+		return nil
+	}
+	statement := "SET ROLE "
+	if local {
+		statement = "SET LOCAL ROLE "
+	}
+	if _, err := q.Exec(ctx, statement+pgx.Identifier{o.Role}.Sanitize()); err != nil {
+		return fmt.Errorf("cannot switch to role %q; the role must exist and the connecting login must be a member of it: %w", o.Role, err)
+	}
+	return nil
+}
+
+// beginAsRole starts a transaction and, when a role is configured, switches to
+// it with SET LOCAL ROLE before any other statement. The switch reverts at commit
+// or rollback. The caller owns the returned transaction.
+func beginAsRole(ctx context.Context, c *pgx.Conn, o options, txOptions pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := c.BeginTx(ctx, txOptions)
+	if err != nil {
+		return nil, err
+	}
+	if err := setRole(ctx, tx, o, true); err != nil {
+		tx.Rollback(context.Background())
+		return nil, err
+	}
+	return tx, nil
+}
+
 // lockTransaction acquires the migration advisory lock on an existing transaction.
 // The caller must commit or roll back that transaction to release the lock.
 func lockTransaction(ctx context.Context, q ledgerQueryer, o options) error {
@@ -199,7 +232,7 @@ func initCommand(ctx context.Context, o options, out io.Writer) error {
 		return err
 	}
 	defer c.Close(context.Background())
-	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := beginAsRole(ctx, c, o, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}
@@ -229,7 +262,14 @@ func statusCommand(ctx context.Context, o options, migrations []migration, check
 		return err
 	}
 	defer c.Close(context.Background())
-	ledger, err := readLedger(ctx, c, o)
+	// A read-only transaction scopes the optional role switch, so status also
+	// works through transaction pooling for a login without rights of its own.
+	tx, err := beginAsRole(ctx, c, o, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	ledger, err := readLedger(ctx, tx, o)
 	if err != nil {
 		return err
 	}
@@ -286,7 +326,7 @@ func baselineCommand(ctx context.Context, o options, migrations []migration, roo
 		return err
 	}
 	defer c.Close(context.Background())
-	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := beginAsRole(ctx, c, o, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}
@@ -399,7 +439,7 @@ func pendingMigrations(ctx context.Context, q ledgerQueryer, o options, migratio
 func applyNextTransaction(ctx context.Context, c *pgx.Conn, o options, migrations []migration, gitSHA any, out io.Writer) (bool, error) {
 	// READ COMMITTED is deliberate: history must include a competing runner's
 	// commit after we acquire the lock, even with a different database default.
-	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := beginAsRole(ctx, c, o, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return false, err
 	}
@@ -439,6 +479,11 @@ func applySession(ctx context.Context, c *pgx.Conn, o options, migrations []migr
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if o.Role != "" {
+			if _, err := c.Exec(cleanup, "RESET ROLE"); err != nil {
+				result = errors.Join(result, fmt.Errorf("reset role: %w", err))
+			}
+		}
 		var unlocked bool
 		err := c.QueryRow(cleanup, "SELECT pg_advisory_unlock($1)", o.lockKey()).Scan(&unlocked)
 		if err == nil && !unlocked {
@@ -448,6 +493,11 @@ func applySession(ctx context.Context, c *pgx.Conn, o options, migrations []migr
 			result = errors.Join(result, fmt.Errorf("release migration lock: %w", err))
 		}
 	}()
+	// Session mode reads history and runs non-transactional SQL outside a
+	// transaction, so the role is switched for the session and reset on exit.
+	if err := setRole(ctx, c, o, false); err != nil {
+		return err
+	}
 	pending, err := pendingMigrations(ctx, c, o, migrations)
 	if err != nil {
 		return err
@@ -471,7 +521,7 @@ func applySession(ctx context.Context, c *pgx.Conn, o options, migrations []migr
 // applyAtomic executes and records one migration in its own transaction. Its
 // session-mode caller must already hold the migration lock; failures roll back.
 func applyAtomic(ctx context.Context, c *pgx.Conn, o options, m migration, gitSHA any) error {
-	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := beginAsRole(ctx, c, o, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}
@@ -498,6 +548,10 @@ func executeAtomic(ctx context.Context, tx pgx.Tx, o options, m migration, gitSH
 // transaction, then records success or failure. Its caller must hold a session
 // lock; interruption can leave an applying row that requires explicit repair.
 func applyNonAtomic(ctx context.Context, c *pgx.Conn, o options, m migration, gitSHA any) error {
+	// Reassert the session role: an earlier migration may have changed it.
+	if err := setRole(ctx, c, o, false); err != nil {
+		return err
+	}
 	if err := insertRecord(ctx, c, o, migrationRecords([]migration{m})[0], gitSHA, 0, false, "applying"); err != nil {
 		return err
 	}
@@ -527,7 +581,7 @@ func repairCommand(ctx context.Context, o options, migrations []migration, versi
 		return err
 	}
 	defer c.Close(context.Background())
-	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := beginAsRole(ctx, c, o, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}

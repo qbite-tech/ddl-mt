@@ -76,8 +76,8 @@ func connect(ctx context.Context, dsn string) (*pgx.Conn, error) {
 }
 
 // connectAndVerify resolves credentials and checks the connected database name.
-// Write callers also require a non-read-only connection. Rejected connections are
-// closed; the caller owns and must close a successfully returned connection.
+// Write callers also require a non-read-only connection, and a configured role
+// must be switchable before any work starts. Rejected connections are closed; the caller owns and must close a successfully returned connection.
 func connectAndVerify(ctx context.Context, config options, writable bool) (*pgx.Conn, error) {
 	dsn, err := getDSN(config)
 	if err != nil {
@@ -102,6 +102,17 @@ func connectAndVerify(ctx context.Context, config options, writable bool) (*pgx.
 	if writable && readOnly {
 		connection.Close(context.Background())
 		return nil, errors.New("database connection is read-only; a write-capable DB_DSN is required")
+	}
+	// Fail before any migration work when the role switch is not permitted.
+	if config.Role != "" {
+		tx, err := beginAsRole(ctx, connection, config, pgx.TxOptions{})
+		if err == nil {
+			err = tx.Rollback(ctx)
+		}
+		if err != nil {
+			connection.Close(context.Background())
+			return nil, err
+		}
 	}
 	return connection, nil
 }

@@ -487,3 +487,128 @@ $body$);`
 		t.Fatal(err)
 	}
 }
+
+// roleTestDatabase extends testDatabase with an owner role holding a private
+// schema and a login that has no rights of its own. ddl-mt connects as that
+// login, which is granted the owner role only when member is true. Both
+// cluster-wide roles are dropped before the test database is removed.
+func roleTestDatabase(t *testing.T, member bool) (options, *pgx.Conn, string) {
+	t.Helper()
+	o, c, dir := testDatabase(t)
+	suffix := strings.TrimPrefix(o.Database, "ddl_mt_test_")
+	owner, login := "ddl_mt_owner_"+suffix, "ddl_mt_login_"+suffix
+	cfg, err := pgx.ParseConfig(os.Getenv("DDL_MT_TEST_DSN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	password := ""
+	if cfg.Password != "" {
+		password = " PASSWORD '" + strings.ReplaceAll(cfg.Password, "'", "''") + "'"
+	}
+	mustExec(t, c, "CREATE ROLE "+owner+" NOLOGIN")
+	// NOINHERIT: membership permits SET ROLE but grants nothing until the switch.
+	mustExec(t, c, "CREATE ROLE "+login+" LOGIN NOINHERIT"+password)
+	t.Cleanup(func() {
+		for _, statement := range []string{"DROP SCHEMA IF EXISTS app CASCADE", "DROP OWNED BY " + owner + ", " + login, "DROP ROLE " + owner + ", " + login} {
+			if _, err := c.Exec(context.Background(), statement); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if member {
+		mustExec(t, c, "GRANT "+owner+" TO "+login)
+	}
+	mustExec(t, c, "CREATE SCHEMA app AUTHORIZATION "+owner)
+	// A later libpq keyword overrides the earlier one, as with dbname.
+	t.Setenv(o.DSNEnv, os.Getenv(o.DSNEnv)+" user="+login)
+	o.LedgerTable = "app.schema_migrations"
+	o.Role = owner
+	return o, c, dir
+}
+
+// relationOwner returns the owning role of a relation in the app schema.
+func relationOwner(t *testing.T, c *pgx.Conn, name string) string {
+	t.Helper()
+	var owner string
+	if err := c.QueryRow(context.Background(), "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = to_regclass($1)", "app."+name).Scan(&owner); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return owner
+}
+
+// TestPostgresRoleOption verifies that a login without rights of its own creates
+// the history table and migration objects as the configured owner role in both
+// connection modes, and that the same login fails loudly without the role.
+func TestPostgresRoleOption(t *testing.T) {
+	o, c, dir := roleTestDatabase(t, true)
+	ctx := context.Background()
+	without := o
+	without.Role = ""
+	if err := initCommand(ctx, without, io.Discard); err == nil {
+		t.Fatal("login without the role initialized the ledger")
+	}
+	if err := initCommand(ctx, o, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	ms := loadTestMigrations(t, dir, o, "CREATE TABLE app.first (id int);", "CREATE TABLE app.second (id int);")
+	if err := applyCommand(ctx, without, ms, dir, io.Discard); err == nil {
+		t.Fatal("login without the role applied migrations")
+	}
+	if err := baselineCommand(ctx, o, ms, dir, "001", io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, c, "CREATE TABLE app.first (id int)")
+	if err := applyCommand(ctx, o, ms, dir, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := statusCommand(ctx, o, ms, true, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	// Session mode covers the history read and SQL that run outside a transaction.
+	o.ConnectionMode, o.AllowNonTransactional = "session", true
+	ms = loadTestMigrations(t, dir, o, "CREATE TABLE app.first (id int);", "CREATE TABLE app.second (id int);",
+		"CREATE TABLE app.third (id int);", "-- migration:transaction=false\nCREATE INDEX CONCURRENTLY third_idx ON app.third(id);",
+		"-- migration:transaction=false\nCREATE TABLE app.fourth (id int); SELECT 1/0;")
+	if err := applyCommand(ctx, o, ms, dir, io.Discard); err == nil {
+		t.Fatal("expected failure")
+	}
+	for _, name := range []string{"schema_migrations", "second", "third", "third_idx", "fourth"} {
+		if owner := relationOwner(t, c, name); owner != o.Role {
+			t.Fatalf("%s is owned by %s, want %s", name, owner, o.Role)
+		}
+	}
+	mustExec(t, c, "DROP TABLE app.fourth")
+	if err := repairCommand(ctx, o, ms, "005", "retry", io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := statusCommand(ctx, o, ms, false, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostgresRoleRequiresMembership verifies every database command refuses to
+// start, before running any SQL, when the login cannot switch to the role.
+func TestPostgresRoleRequiresMembership(t *testing.T) {
+	o, c, dir := roleTestDatabase(t, false)
+	ctx := context.Background()
+	mustExec(t, c, bootstrapSQL(o))
+	ms := loadTestMigrations(t, dir, o, "CREATE TABLE public.must_not_run (id int);")
+	mustExec(t, c, "GRANT CREATE ON SCHEMA public TO PUBLIC")
+	missing := o
+	missing.Role = "ddl_mt_no_such_role"
+	for _, tc := range []options{o, missing} {
+		for name, run := range map[string]func() error{
+			"init":   func() error { return initCommand(ctx, tc, io.Discard) },
+			"status": func() error { return statusCommand(ctx, tc, ms, false, io.Discard) },
+			"apply":  func() error { return applyCommand(ctx, tc, ms, dir, io.Discard) },
+		} {
+			if err := run(); err == nil || !strings.Contains(err.Error(), "cannot switch to role") {
+				t.Fatalf("%s as %s: %v", name, tc.Role, err)
+			}
+		}
+	}
+	var exists bool
+	if err := c.QueryRow(ctx, "SELECT to_regclass('public.must_not_run') IS NOT NULL").Scan(&exists); err != nil || exists {
+		t.Fatalf("migration ran without the role: %v %v", exists, err)
+	}
+}
