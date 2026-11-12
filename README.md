@@ -37,13 +37,13 @@ go install .
 
 ## Versioning
 
-`ddl-mt version` and `ddl-mt --version` report a semantic version, currently `0.2.0`.
+`ddl-mt version` and `ddl-mt --version` report a semantic version, currently `0.3.0`.
 The `VERSION` file supplies the version for local builds and `go install .`.
 Installation from a published Go module uses that module's version; a build-time
 `-X main.version=...` override takes precedence. For example:
 
 ```sh
-make build VERSION=0.2.0-rc.1
+make build VERSION=0.3.0-rc.1
 bin/ddl-mt version
 ```
 
@@ -182,6 +182,7 @@ discovery instead of selecting an ancestor project. Each target supports:
 | `dsn_env` | Optional environment variable containing the connection string. |
 | `credentials_file` | Optional JSON credentials file; cannot be combined with `dsn_env`. |
 | `ledger_table` | `public.schema_migrations`. Use lowercase `schema.table`. |
+| `role` | Optional PostgreSQL role that ddl-mt switches to for all database work, so the history table and migrated objects are owned by it. See [Creating objects as an owner role](#creating-objects-as-an-owner-role). |
 | `lock_key` | Optional 64-bit integer advisory-lock key; defaults to a fixed ddl-mt key. Set it only to coordinate with another runner that already uses a specific key. |
 | `connection_mode` | `transaction` (default): safe for direct PostgreSQL and transaction/session pooling. `session`: requires a direct or verified session-pooled endpoint; enables non-transactional execution when opted in. |
 | `allow_non_transactional` | `false`; explicit opt-in for SQL that cannot run atomically. |
@@ -219,6 +220,43 @@ Every writer of one history table must use the same `lock_key`. Runners with
 different keys do not exclude each other and can apply the same migration
 concurrently, so change the key only while all other writers are stopped.
 
+### Creating objects as an owner role
+
+PostgreSQL makes the creating role the owner of each new object. To keep
+ownership with one role regardless of who runs migrations, connect as a login
+that has no rights of its own and name the owner in the target:
+
+```json
+"role": "shop_owner"
+```
+
+```sql
+CREATE ROLE shop_owner NOLOGIN;
+CREATE ROLE shop_migrate LOGIN NOINHERIT PASSWORD '...';
+GRANT shop_owner TO shop_migrate;
+```
+
+`NOINHERIT` matters: the login may switch to the owner but holds none of its
+privileges until it does, so SQL that runs without the switch fails with a
+permission error instead of creating an object owned by the login.
+
+With `role` set:
+
+- Every transaction ddl-mt opens (`init`, `status`, `check`, `apply`, `baseline`,
+  `repair`) starts with `SET LOCAL ROLE`, before the lock, the migration SQL,
+  and the history write. The switch ends at commit or rollback, so it is safe
+  with PgBouncer transaction pooling.
+- In `connection_mode: "session"`, `apply` also runs `SET ROLE` for the session,
+  covering non-transactional migrations, and `RESET ROLE` when the run ends.
+- Every database command first verifies the switch and refuses to start if the
+  role does not exist or the login is not a member of it.
+
+The history table must be usable by the role; `init` creates it as the role.
+`--role <name>` before the command overrides the target and also works in direct
+mode. The name is quoted as an identifier, so it is case-sensitive. A migration
+that changes the role itself (`SET ROLE`, `RESET ROLE`) overrides the switch for
+its remaining statements.
+
 ### Direct mode
 
 Simple usage does not require a project file:
@@ -236,7 +274,7 @@ targets, including when supplied through environment variables.
 
 ## PostgreSQL and PgBouncer
 
-Version 0.2.0 defaults to `connection_mode: "transaction"`. Each atomic migration
+The default is `connection_mode: "transaction"`. Each atomic migration
 acquires a transaction advisory lock, rechecks the complete history, executes SQL,
 and records success in the same transaction. Commit or rollback releases the lock.
 Concurrent runners may alternate between files; each rereads history under the lock

@@ -8,6 +8,21 @@ While in `0.x`, a new minor version may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0]
+
+### Added
+
+- Optional per-target `role` (and `--role` flag): ddl-mt switches to that
+  PostgreSQL role for all database work, so the history table and migrated
+  objects are owned by it rather than by the connecting login. Transactions use
+  `SET LOCAL ROLE`, which is safe with PgBouncer transaction pooling; session
+  mode also uses `SET ROLE`/`RESET ROLE` for non-transactional migrations.
+  Commands refuse to start when the login cannot switch to the role.
+
+### Changed
+
+- `status` and `check` read history inside a read-only transaction.
+
 ## [0.2.0]
 
 First public release.
@@ -44,5 +59,6 @@ First public release.
 - Concurrent-index detection and migration metadata parsing no longer
   misclassify SQL inside strings, dollar-quoted bodies, or comments.
 
-[Unreleased]: https://github.com/qbite-tech/ddl-mt/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/qbite-tech/ddl-mt/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/qbite-tech/ddl-mt/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/qbite-tech/ddl-mt/releases/tag/v0.2.0

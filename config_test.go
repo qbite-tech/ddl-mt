@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -166,5 +167,38 @@ func TestDuplicateProjectKeysRejectAmbiguousTargets(t *testing.T) {
 		if _, err := readProject(path); err == nil {
 			t.Errorf("ambiguous project accepted: %s", contents)
 		}
+	}
+}
+
+// TestRoleOption checks that a target role reaches the options, that --role
+// overrides it and works in direct mode, and that unusable names are rejected.
+func TestRoleOption(t *testing.T) {
+	t.Setenv("MIGRATIONS_DATABASE", "")
+	t.Setenv("MIGRATIONS_ROOT", "")
+	path := filepath.Join(t.TempDir(), "ddl-mt.json")
+	putFile(t, path, `{"project":"test","targets":{"plain":{"database":"db","migrations_dir":"migrations"},"owned":{"database":"db","migrations_dir":"migrations","role":"app_owner"}}}`)
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--database", "db", "apply"}, ""},
+		{[]string{"--database", "db", "--role", "app_owner", "apply"}, "app_owner"},
+		{[]string{"--project", path, "--target", "plain", "apply"}, ""},
+		{[]string{"--project", path, "--target", "owned", "apply"}, "app_owner"},
+		{[]string{"--project", path, "--target", "owned", "--role", "Other Owner", "apply"}, "Other Owner"},
+	} {
+		o, _, _, err := parseOptions(tc.args)
+		if err != nil || o.Role != tc.want {
+			t.Fatalf("%v: %+v %v", tc.args, o, err)
+		}
+	}
+	for _, role := range []string{" padded", "line\nbreak", strings.Repeat("r", 64)} {
+		if _, _, _, err := parseOptions([]string{"--database", "db", "--role", role, "apply"}); err == nil {
+			t.Fatalf("accepted role %q", role)
+		}
+	}
+	putFile(t, path, `{"project":"test","targets":{"bad":{"database":"db","migrations_dir":"migrations","role":" padded"}}}`)
+	if _, err := readProject(path); err == nil {
+		t.Fatal("invalid target role accepted")
 	}
 }

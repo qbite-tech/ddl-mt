@@ -24,6 +24,7 @@ type targetConfig struct {
 	DSNEnv                string `json:"dsn_env,omitempty"`
 	CredentialsFile       string `json:"credentials_file,omitempty"`
 	LedgerTable           string `json:"ledger_table,omitempty"`
+	Role                  string `json:"role,omitempty"`
 	LockKey               *int64 `json:"lock_key,omitempty"`
 	AllowNonTransactional bool   `json:"allow_non_transactional,omitempty"`
 }
@@ -38,7 +39,7 @@ type options struct {
 	LockTimeout                                         time.Duration
 	Database, MigrationsRoot, MigrationsDir, ConfigPath string
 	Project, ProjectPath, Target, DSNEnv                string
-	LedgerTable                                         string
+	LedgerTable, Role                                   string
 	LockKey                                             *int64
 	AllowNonTransactional                               bool
 	Timeout                                             time.Duration
@@ -57,6 +58,7 @@ func parseOptions(args []string) (options, string, []string, error) {
 	f.StringVar(&o.MigrationsRoot, "migrations-root", strings.TrimSpace(os.Getenv("MIGRATIONS_ROOT")), "parent of database directories")
 	f.StringVar(&o.ConfigPath, "config", "", "credentials JSON file containing DB_DSN")
 	f.StringVar(&o.ConnectionMode, "connection-mode", "", "transaction (default) or session; session requires a direct or session-pooled endpoint")
+	role := f.String("role", "", "PostgreSQL role to switch to for all database work; overrides target")
 	f.DurationVar(&o.LockTimeout, "lock-timeout", 30*time.Second, "maximum migration lock wait")
 	f.DurationVar(&o.Timeout, "timeout", 5*time.Minute, "database command deadline, including lock waits")
 	if err := f.Parse(args); err != nil {
@@ -101,6 +103,7 @@ func parseOptions(args []string) (options, string, []string, error) {
 		o.MigrationsDir = relativeTo(filepath.Dir(path), target.MigrationsDir)
 		o.LedgerTable, o.LockKey = target.LedgerTable, target.LockKey
 		o.AllowNonTransactional = target.AllowNonTransactional
+		o.Role = target.Role
 		if o.ConnectionMode == "" {
 			o.ConnectionMode = target.ConnectionMode
 		}
@@ -118,6 +121,12 @@ func parseOptions(args []string) (options, string, []string, error) {
 	}
 	if o.LedgerTable == "" {
 		o.LedgerTable = "public.schema_migrations"
+	}
+	if *role != "" {
+		o.Role = *role
+	}
+	if err := validateRole(o.Role); err != nil {
+		return o, "", nil, err
 	}
 	return o, command, remaining[1:], nil
 }
@@ -187,7 +196,7 @@ func readProject(path string) (projectConfig, error) {
 			return p, fmt.Errorf("target %s requires migrations_dir", name)
 		}
 		// These values reach terminals, generated SQL comments, and file paths.
-		for field, value := range map[string]string{"database": target.Database, "migrations_dir": target.MigrationsDir, "dsn_env": target.DSNEnv, "credentials_file": target.CredentialsFile} {
+		for field, value := range map[string]string{"database": target.Database, "migrations_dir": target.MigrationsDir, "dsn_env": target.DSNEnv, "credentials_file": target.CredentialsFile, "role": target.Role} {
 			if containsControl(value) {
 				return p, fmt.Errorf("target %s %s must not contain control characters", name, field)
 			}
@@ -196,6 +205,9 @@ func readProject(path string) (projectConfig, error) {
 			return p, fmt.Errorf("target %s ledger_table must be a lowercase schema.table", name)
 		}
 		if err := validateConnectionMode(target.ConnectionMode); err != nil {
+			return p, fmt.Errorf("target %s: %w", name, err)
+		}
+		if err := validateRole(target.Role); err != nil {
 			return p, fmt.Errorf("target %s: %w", name, err)
 		}
 		if target.DSNEnv != "" && target.CredentialsFile != "" {
@@ -276,4 +288,17 @@ func validateConnectionMode(mode string) error {
 	default:
 		return errors.New("connection_mode must be transaction or session")
 	}
+}
+
+// validateRole accepts an empty value (no role switch) or one PostgreSQL role
+// name of at most 63 bytes without control characters or surrounding space.
+// The name is always quoted as an identifier, so it is matched case-sensitively.
+func validateRole(role string) error {
+	if role == "" {
+		return nil
+	}
+	if len(role) > 63 || containsControl(role) || strings.TrimSpace(role) != role {
+		return errors.New("role must be a PostgreSQL role name of at most 63 bytes without control characters or surrounding spaces")
+	}
+	return nil
 }
